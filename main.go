@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -23,29 +24,39 @@ const (
 
 func initAudioSystem() {
 	// Create virtual loopback device
-	exec.Command("sudo", "modprobe", "snd-aloop").Run()
+	// exec.Command("sudo", "modprobe", "snd-aloop").Run()
 
 	// Configure PulseAudio in memory
 	exec.Command("pulseaudio", "--start", "--exit-idle-time=-1").Run()
 
 	// Set default sample format
 	exec.Command("pactl", "set-default-sample-format", "s16le").Run()
+	// Give a moment for PulseAudio to initialize
+	time.Sleep(500 * time.Millisecond)
 }
 
-func RunMeetingBot(meetingURL, guestName string) error {
+func RunMeetingBot(meetingURL string, botName string, guestEmail string, guestName string) error {
 	initAudioSystem()
 	// Generate a unique filename with timestamp
 	// filename := fmt.Sprintf("meeting_%s.mp3", time.Now().Format("20060102_150405"))
 	// audioFilePath := filepath.Join(recordingFolder, filename)
 
-	// Generate unique sink ID
-	sinkID := fmt.Sprintf("%d_%s", time.Now().UnixNano(), guestName)
-	sinkID = strings.ReplaceAll(sinkID, " ", "_")
+	// Generate a unique, safe sink ID using timestamp and sanitized name
+	sinkID := fmt.Sprintf("%d_%s", time.Now().UnixNano(), sanitizeName(botName))
+	// sinkID = strings.ReplaceAll(sinkID, " ", "_")
+	// sinkID = strings.ReplaceAll(sinkID, " ", "_")
+	// sinkID = strings.ReplaceAll(sinkID, "'", "") // Add this line to remove apostrophes
 
 	// Create dedicated audio sink
-	if _, err := createAudioSink(sinkID); err != nil {
+	sinkName, err := createAudioSink(sinkID)
+	if err != nil {
 		return fmt.Errorf("audio sink creation failed: %v", err)
 	}
+
+	// Generate a unique filename with timestamp and sink ID
+	filename := fmt.Sprintf("meeting_%s_%s.mp3",
+		time.Now().Format("20060102_150405"), sinkID)
+	audioFilePath := filepath.Join(recordingFolder, filename)
 
 	// Ensure recording directory exists
 	if err := os.MkdirAll(recordingFolder, os.ModePerm); err != nil {
@@ -53,16 +64,21 @@ func RunMeetingBot(meetingURL, guestName string) error {
 	}
 
 	// Modified filename with sink ID
-	filename := fmt.Sprintf("meeting_%s_%s.mp3",
-		time.Now().Format("20060102_150405"), sinkID)
-	audioFilePath := filepath.Join(recordingFolder, filename)
+	// filename := fmt.Sprintf("meeting_%s_%s.mp3",
+	// 	time.Now().Format("20060102_150405"), "abc")
+	// // audioFilePath := filepath.Join(recordingFolder, filename)
 
 	// Start recording
-	recordCmd := startRecording(audioFilePath, sinkID)
+	// recordCmd := startRecording("test.mp3", "sinkID")
+	// recordCmd := startRecording("test123.mp3", "VirtualMic") // or "VirtualMic.2"
+
+	monitorSource := sinkName + ".monitor"
+	recordCmd := startRecording(audioFilePath, monitorSource)
+
 	// Add cleanup defer
 	defer func() {
-		stopRecordingGracefully(recordCmd)
-		destroyAudioSink(sinkID)
+		stopRecordingGracefully(recordCmd,audioFilePath)
+		destroyAudioSink(sinkName)
 	}()
 
 	// Initialize Playwright
@@ -85,7 +101,13 @@ func RunMeetingBot(meetingURL, guestName string) error {
 		return fmt.Errorf("failed to create page: %v", err)
 	}
 
-	fmt.Printf("Joining meeting: %s as %s\n", meetingURL, guestName)
+	// Set the audio output device for the browser to our sink
+	// This is crucial for capturing the meeting audio
+	if err := setAudioOutputDevice(page, sinkName); err != nil {
+		fmt.Printf("Warning: Could not set audio output device: %v\n", err)
+	}
+
+	fmt.Printf("Joining meeting: %s as %s\n", meetingURL, botName)
 
 	// Navigate to the meeting URL
 	if _, err := page.Goto(meetingURL); err != nil {
@@ -97,17 +119,43 @@ func RunMeetingBot(meetingURL, guestName string) error {
 	simulateHumanBehavior(page)
 
 	// Join the meeting
-	if err := joinMeeting(page, guestName); err != nil {
+	if err := joinMeeting(page, botName); err != nil {
 		log.Printf("Error joining meeting: %v", err)
 	}
 
 	// Wait for meeting to end
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go monitorMeetingEnd(page, recordCmd, audioFilePath, &wg)
+	go monitorMeetingEnd(page, recordCmd, audioFilePath, guestEmail, guestName, &wg)
 	wg.Wait()
 
 	return nil
+}
+
+// sanitizeName creates a safe string for use in sink names
+func sanitizeName(name string) string {
+	// Replace spaces, apostrophes, and other problematic characters
+	sanitized := strings.ReplaceAll(name, " ", "_")
+	sanitized = strings.ReplaceAll(sanitized, "'", "")
+	sanitized = strings.ReplaceAll(sanitized, "\"", "")
+	sanitized = strings.ReplaceAll(sanitized, "(", "")
+	sanitized = strings.ReplaceAll(sanitized, ")", "")
+	// Add more replacements as needed
+	return sanitized
+}
+
+// setAudioOutputDevice attempts to set the audio output device for the browser
+// Modify setAudioOutputDevice in main.go
+func setAudioOutputDevice(page playwright.Page, sinkName string) error {
+	// Check if the browser supports audio output selection
+	supported, err := page.Evaluate(`() => typeof navigator.mediaDevices.selectAudioOutput === 'function'`)
+	if err != nil || !supported.(bool) {
+		fmt.Println("Audio output selection not supported, skipping...")
+		return nil
+	}
+
+	_, err = page.Evaluate(`sink => navigator.mediaDevices.selectAudioOutput({ deviceId: sink })`, sinkName)
+	return err
 }
 
 func launchBrowser(pw *playwright.Playwright) (playwright.Browser, error) {
@@ -130,16 +178,16 @@ func simulateHumanBehavior(page playwright.Page) {
 }
 
 // joinMeeting handles the process of joining a Google Meet
-func joinMeeting(page playwright.Page, guestName string) error {
+func joinMeeting(page playwright.Page, botName string) error {
 	// Fill in name if the field is available
 	nameInput := page.Locator("input[aria-label='Your name']")
 	if nameInput != nil {
 		isVisible, err := nameInput.IsVisible()
 		if err == nil && isVisible {
-			if err := nameInput.Fill(guestName); err != nil {
+			if err := nameInput.Fill(botName); err != nil {
 				log.Printf("Could not fill name: %v", err)
 			} else {
-				fmt.Println("Entered guest name")
+				fmt.Println("Entered guest name:", botName)
 			}
 		}
 	}
@@ -185,12 +233,14 @@ func handleButton(page playwright.Page, selector string, buttonName string) bool
 }
 
 // startRecording starts the FFmpeg process to record the meeting audio
-func startRecording(filepath, sinkID string) *exec.Cmd {
+func startRecording(filepath, sourceName string) *exec.Cmd {
+	fmt.Println("Starting recording from:", sourceName)
 	cmd := exec.Command("ffmpeg",
 		"-f", "pulse",
-		"-i", fmt.Sprintf("bot_sink_%s", sinkID),
+		"-i", sourceName,
+		// "-i", sourceName+".monitor",
 		"-ac", "2",
-		"-ar", "44100",
+		"-ar", "48000",
 		"-c:a", "libmp3lame",
 		"-b:a", "192k",
 		filepath,
@@ -208,13 +258,15 @@ func startRecording(filepath, sinkID string) *exec.Cmd {
 }
 
 // stopRecordingGracefully properly stops the FFmpeg recording process
-func stopRecordingGracefully(recordCmd *exec.Cmd) {
+func stopRecordingGracefully(recordCmd *exec.Cmd, audioFilePath string) {
 	fmt.Println("Stopping recording...")
 	if recordCmd.Process != nil {
 		recordCmd.Process.Signal(os.Interrupt)
 		recordCmd.Wait()
 		fmt.Println("Recording stopped")
 	}
+	processRecording(audioFilePath)
+
 }
 
 // randomDelay adds a random delay between actions to simulate human behavior
@@ -224,16 +276,19 @@ func randomDelay(min, max int) {
 }
 
 // monitorMeetingEnd continuously checks if the user has left the meeting
-func monitorMeetingEnd(page playwright.Page, recordCmd *exec.Cmd, audioFilePath string, wg *sync.WaitGroup) {
+func monitorMeetingEnd(page playwright.Page, recordCmd *exec.Cmd, audioFilePath, guestEmail string, guestName string, wg *sync.WaitGroup) {
 	defer wg.Done()
+	fmt.Println("Audio file path:", audioFilePath)
 
 	// Target person information
-	targetPerson := "basits@zenithive.com" // Email of the person we're tracking
-	targetPersonName := "Basit Saiyed"     // Name of the person we're tracking
+	targetPerson := guestEmail    // Email of the person we're tracking
+	targetPersonName := guestName // Name of the person we're tracking
 
 	// Track how long we've been in the meeting after the target person has left
 	targetPersonLeftTime := time.Time{}
 	exitTimeoutAfterTargetLeaves := 20 * time.Second
+
+	fmt.Println("Monitoring meeting for target person:------------", targetPerson, targetPersonName)
 
 	for {
 		// Check for meeting exit indicators
@@ -250,13 +305,13 @@ func monitorMeetingEnd(page playwright.Page, recordCmd *exec.Cmd, audioFilePath 
 				stopRecording(recordCmd)
 				page.Close()
 
-				processRecording(audioFilePath)
 				return
 			}
 		}
 		// Check if target person is still in the meeting
 		targetPresent := isPersonInMeeting(page, targetPerson, targetPersonName)
 		if !targetPresent {
+			fmt.Println("Checking if target person is in the meeting...")
 			// Target person is not in the meeting
 			if targetPersonLeftTime.IsZero() {
 				// First detection of target person absence, start timer
@@ -271,10 +326,10 @@ func monitorMeetingEnd(page playwright.Page, recordCmd *exec.Cmd, audioFilePath 
 				stopRecording(recordCmd)
 				page.Close()
 
-				processRecording(audioFilePath)
 				return
 			}
 		} else {
+			fmt.Println("Currently in the meeting, target person is present.")
 			// Target person is back in the meeting, reset timer if needed
 			if !targetPersonLeftTime.IsZero() {
 				fmt.Printf("Target person %s (%s) is back in the meeting. Resetting exit timer.\n",
@@ -359,18 +414,69 @@ func isPersonInMeeting(page playwright.Page, personEmail string, personName stri
 }
 
 func createAudioSink(sinkID string) (string, error) {
+	// Create a safer sink name with only alphanumeric characters
+	sinkName := fmt.Sprintf("bot_sink_%s", sinkID)
+
+	// Load the null-sink module with our sink name
 	cmd := exec.Command("pactl", "load-module", "module-null-sink",
-		fmt.Sprintf("sink_name=bot_sink_%s", sinkID),
-		fmt.Sprintf("sink_properties=device.description=MeetingBot_%s", sinkID))
-	if err := cmd.Run(); err != nil {
-		return "", err
+		fmt.Sprintf("sink_name=%s", sinkName),
+		fmt.Sprintf("sink_properties=device.description=MeetingBot_%s", sinkID),
+	)
+	output, err := cmd.CombinedOutput() // Capture command output
+	if err != nil {
+		return "", fmt.Errorf("pactl error: %v, output: %s", err, string(output))
 	}
-	return fmt.Sprintf("bot_sink_%s", sinkID), nil
+
+	// Verify the sink was created
+	verifySinkCmd := exec.Command("pactl", "list", "short", "sinks")
+	verifyOutput, err := verifySinkCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("verification error: %v", err)
+	}
+
+	if !strings.Contains(string(verifyOutput), sinkName) {
+		return "", fmt.Errorf("sink creation failed: sink not found in list")
+	}
+
+	fmt.Printf("Successfully created audio sink: %s\n", sinkName)
+	return sinkName, nil
 }
 
-func destroyAudioSink(sinkID string) error {
-	return exec.Command("pactl", "unload-module",
-		fmt.Sprintf("module-null-sink.sink_name=bot_sink_%s", sinkID)).Run()
+// destroyAudioSink unloads the null-sink module
+func destroyAudioSink(sinkName string) error {
+	// Get the module ID for the sink
+	listCmd := exec.Command("pactl", "list", "short", "modules")
+	output, err := listCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("error listing modules: %v", err)
+	}
+
+	// Find the module ID for our sink
+	lines := strings.Split(string(output), "\n")
+	moduleID := ""
+
+	for _, line := range lines {
+		if strings.Contains(line, sinkName) {
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				moduleID = fields[0]
+				break
+			}
+		}
+	}
+
+	if moduleID == "" {
+		return fmt.Errorf("module for sink %s not found", sinkName)
+	}
+
+	// Unload the module
+	unloadCmd := exec.Command("pactl", "unload-module", moduleID)
+	if err := unloadCmd.Run(); err != nil {
+		return fmt.Errorf("error unloading module: %v", err)
+	}
+
+	fmt.Printf("Successfully destroyed audio sink: %s\n", sinkName)
+	return nil
 }
 
 // openParticipantPanel attempts to open the participants panel if not already open
@@ -414,7 +520,7 @@ func openParticipantPanel(page playwright.Page) {
 				if !panelAlreadyOpen {
 					// Click to open panel
 					if err := button.Click(); err == nil {
-						// fmt.Println("Opened participants panel")
+						fmt.Println("Opened participants panel")
 						// Wait for panel to appear
 						time.Sleep(1 * time.Second)
 						return
@@ -498,6 +604,11 @@ func leaveCurrentMeeting(page playwright.Page) {
 
 // processRecording handles transcription and summarization of the audio file
 func processRecording(audioFilePath string) {
+	time.Sleep(2 * time.Second)
+	if _, err := os.Stat(audioFilePath); os.IsNotExist(err) {
+		fmt.Println("Error: Audio file not found:", audioFilePath)
+		return
+	}
 	// Transcribe the audio
 	transcript, err := transcribeAudio(audioFilePath)
 	if err != nil {
@@ -562,13 +673,21 @@ func stopRecording(recordCmd *exec.Cmd) {
 
 // transcribeAudio runs the Python transcription script
 func transcribeAudio(filePath string) (string, error) {
-	fmt.Println("Transcribing audio...")
-	cmd := exec.Command("python3", "transcribe.py", filePath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("error running transcription script: %v", err)
-	}
-	return string(output), nil
+    fmt.Println("Transcribing audio...")
+    cmd := exec.Command("./venv/bin/python", "transcribe.py", filePath)
+    
+    // Capture both stdout and stderr separately
+    var stdout, stderr bytes.Buffer
+    cmd.Stdout = &stdout
+    cmd.Stderr = &stderr
+
+    err := cmd.Run()
+    if err != nil {
+        return "", fmt.Errorf("transcription error: %v\nPython Error: %s", 
+            err, stderr.String())
+    }
+    
+    return stdout.String(), nil
 }
 
 // isElementVisible checks if a Playwright locator is visible

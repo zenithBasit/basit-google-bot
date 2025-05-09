@@ -8,7 +8,9 @@ import (
 
 type MeetingRequest struct {
 	MeetingURL string `json:"meeting_url"`
-	GuestName  string `json:"guest_name"`
+	BotName  string `json:"bot_name"`
+	GuestEmail      string `json:"email"`
+	GuestName	   string `json:"name"`
 }
 
 func main() {
@@ -30,7 +32,7 @@ func handleStartMeeting(w http.ResponseWriter, r *http.Request) {
     sem <- struct{}{}
     go func() {
         defer func() { <-sem }()
-        if err := RunMeetingBot(req.MeetingURL, req.GuestName); err != nil {
+        if err := RunMeetingBot(req.MeetingURL, req.BotName, req.GuestEmail, req.GuestName); err != nil {
             log.Printf("Meeting bot error: %v", err)
         }
     }()

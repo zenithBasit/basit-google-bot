@@ -1,19 +1,22 @@
 import sys
 import whisper
 import warnings
-warnings.filterwarnings("ignore")  # Suppresses warnings
 
+warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*")
+warnings.filterwarnings("ignore", category=UserWarning)
 
 def transcribe_audio(file_path):
-    model = whisper.load_model("base")  # Load Whisper AI model
-    result = model.transcribe(file_path)
-    return result["text"]  # Return transcribed text
+    try:
+        model = whisper.load_model("base")
+        result = model.transcribe(file_path, fp16=False)  # Explicitly disable FP16
+        return result["text"]
+    except Exception as e:
+        print(f"CRITICAL_ERROR: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python transcribe.py <audio_file>")
         sys.exit(1)
-
-    audio_file = sys.argv[1]  # Get the file path from the command line
-    transcription = transcribe_audio(audio_file)
-    print(transcription)  # Print the transcription for Go to capture
+    
+    print(transcribe_audio(sys.argv[1]))

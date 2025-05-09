@@ -1,0 +1,321 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+const (
+	recordingFolder  = "recordings"
+	transcriptFolder = "transcripts"
+	summaryFolder    = "summaries"
+	vbCableName      = "CABLE Input (VB-Audio Virtual Cable)"
+)
+
+func initAudioSystem() {
+	if runtime.GOOS == "windows" {
+		fmt.Println("Using VB-Cable audio input:", vbCableName)
+		return
+	}
+}
+
+func RunMeetingBot(meetingURL, botName, guestEmail, guestName string) error {
+	initAudioSystem()
+
+	// Create recording filename
+	filename := fmt.Sprintf("meeting_%s_%s.mp3",
+		time.Now().Format("20060102_150405"),
+		sanitizeName(botName))
+	
+	audioFilePath := filepath.Join(recordingFolder, filename)
+	
+	if err := os.MkdirAll(recordingFolder, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create recording directory: %v", err)
+	}
+
+	// Start recording
+	recordCmd := startRecording(audioFilePath)
+	defer stopRecordingGracefully(recordCmd)
+
+	// Launch browser
+	pw, err := playwright.Run()
+	if err != nil {
+		return fmt.Errorf("failed to start Playwright: %v", err)
+	}
+	defer pw.Stop()
+
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(false),
+		Args: []string{
+			"--disable-blink-features=AutomationControlled",
+			"--use-fake-ui-for-media-stream",
+			"--autoplay-policy=no-user-gesture-required",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to launch browser: %v", err)
+	}
+	defer browser.Close()
+
+	page, err := browser.NewPage()
+	if err != nil {
+		return fmt.Errorf("failed to create page: %v", err)
+	}
+
+	fmt.Printf("Joining meeting: %s as %s\n", meetingURL, botName)
+	if _, err := page.Goto(meetingURL); err != nil {
+		return fmt.Errorf("failed to navigate to meeting URL: %v", err)
+	}
+
+	randomDelay(2, 5)
+	simulateHumanBehavior(page)
+
+	if err := joinMeeting(page, botName); err != nil {
+		log.Printf("Error joining meeting: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go monitorMeetingEnd(page, recordCmd, audioFilePath, guestEmail, guestName, &wg)
+	wg.Wait()
+
+	return nil
+}
+
+func startRecording(filePath string) *exec.Cmd {
+	fmt.Println("Starting recording using VB-Cable...")
+	cmd := exec.Command("ffmpeg",
+		"-f", "dshow",
+		"-i", fmt.Sprintf("audio=\"%s\"", vbCableName),
+		"-c:a", "libmp3lame",
+		"-b:a", "192k",
+		filePath,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("Failed to start FFmpeg recording: %v", err)
+	}
+
+	fmt.Println("Recording started:", filePath)
+	return cmd
+}
+
+func stopRecordingGracefully(recordCmd *exec.Cmd) {
+	fmt.Println("Stopping recording...")
+	if recordCmd.Process != nil {
+		if runtime.GOOS == "windows" {
+			exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(recordCmd.Process.Pid)).Run()
+		} else {
+			recordCmd.Process.Signal(os.Interrupt)
+		}
+		recordCmd.Wait()
+		fmt.Println("Recording stopped")
+	}
+}
+
+func sanitizeName(name string) string {
+	sanitized := strings.ReplaceAll(name, " ", "_")
+	sanitized = strings.ReplaceAll(sanitized, "'", "")
+	sanitized = strings.ReplaceAll(sanitized, "\"", "")
+	return sanitized
+}
+
+func simulateHumanBehavior(page playwright.Page) {
+	page.Mouse().Move(100+float64(rand.Intn(300)), 100+float64(rand.Intn(200)))
+	page.Mouse().Wheel(0, 100)
+	randomDelay(1, 2)
+}
+
+func joinMeeting(page playwright.Page, guestName string) error {
+	nameInput := page.Locator("input[aria-label='Your name']")
+	if nameInput != nil {
+		if isVisible, _ := nameInput.IsVisible(); isVisible {
+			if err := nameInput.Fill(guestName); err != nil {
+				log.Printf("Could not fill name: %v", err)
+			} else {
+				fmt.Println("Entered guest name:", guestName)
+			}
+		}
+	}
+
+	handleButton(page, "button:has-text('Got it')", "Got it")
+	handleButton(page, "[aria-label='Turn off microphone']", "Turn off microphone")
+	handleButton(page, "[aria-label='Turn off camera']", "Turn off camera")
+
+	if !handleButton(page, "button:has-text('Join now')", "Join now") {
+		if !handleButton(page, "button:has-text('Ask to join')", "Ask to join") {
+			return fmt.Errorf("could not find any join button")
+		}
+	}
+
+	fmt.Println("Successfully requested to join the meeting")
+	return nil
+}
+
+func handleButton(page playwright.Page, selector string, buttonName string) bool {
+	button := page.Locator(selector)
+	if button == nil {
+		return false
+	}
+
+	if isVisible, _ := button.IsVisible(); !isVisible {
+		return false
+	}
+
+	if err := button.Click(); err != nil {
+		log.Printf("Could not click %s button: %v", buttonName, err)
+		return false
+	}
+
+	fmt.Printf("Clicked %s button\n", buttonName)
+	randomDelay(1, 3)
+	return true
+}
+
+func monitorMeetingEnd(page playwright.Page, recordCmd *exec.Cmd, audioFilePath, guestEmail, guestName string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	targetPersonLeftTime := time.Time{}
+	exitTimeout := 20 * time.Second
+
+	for {
+		exitIndicators := []string{
+			"text='You have left the meeting'",
+			"text='No one else is in the meeting'",
+			"button:has-text('Rejoin')",
+		}
+
+		for _, indicator := range exitIndicators {
+			if isElementVisible(page.Locator(indicator)) {
+				fmt.Println("Meeting ended. Stopping recording...")
+				stopRecording(recordCmd)
+				page.Close()
+				processRecording(audioFilePath)
+				return
+			}
+		}
+
+		targetPresent := isPersonInMeeting(page, guestEmail, guestName)
+		if !targetPresent {
+			if targetPersonLeftTime.IsZero() {
+				targetPersonLeftTime = time.Now()
+				fmt.Printf("%s left. Starting exit timer.\n", guestName)
+			} else if time.Since(targetPersonLeftTime) > exitTimeout {
+				fmt.Printf("Timeout reached. Leaving meeting.\n")
+				leaveMeeting(page)
+				stopRecording(recordCmd)
+				page.Close()
+				processRecording(audioFilePath)
+				return
+			}
+		} else if !targetPersonLeftTime.IsZero() {
+			targetPersonLeftTime = time.Time{}
+			fmt.Printf("%s rejoined. Resetting timer.\n", guestName)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func isPersonInMeeting(page playwright.Page, email, name string) bool {
+	selectors := []string{
+		fmt.Sprintf("div[aria-label*='%s']", name),
+		fmt.Sprintf("div[data-email='%s']", email),
+		"div[data-participant-id]",
+	}
+
+	for _, selector := range selectors {
+		if elem := page.Locator(selector); elem != nil {
+			if visible, _ := elem.IsVisible(); visible {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func leaveMeeting(page playwright.Page) {
+	buttons := []string{
+		"[aria-label='Leave call']",
+		"button:has-text('Leave')",
+		"button:has-text('Hang up')",
+	}
+
+	for _, btn := range buttons {
+		if elem := page.Locator(btn); elem != nil {
+			if visible, _ := elem.IsVisible(); visible {
+				elem.Click()
+				fmt.Println("Left meeting successfully")
+				return
+			}
+		}
+	}
+	fmt.Println("Could not find leave button. Closing page.")
+	page.Close()
+}
+
+func processRecording(audioFilePath string) {
+	if _, err := os.Stat(audioFilePath); os.IsNotExist(err) {
+		fmt.Println("Audio file missing:", audioFilePath)
+		return
+	}
+
+	transcript, err := transcribeAudio(audioFilePath)
+	if err != nil {
+		fmt.Println("Transcription failed:", err)
+		return
+	}
+
+	if err := saveOutput(audioFilePath, transcriptFolder, transcript); err != nil {
+		fmt.Println("Failed to save transcript:", err)
+	}
+
+	summary, err := ollama.RunOllama(transcript)
+	if err != nil {
+		fmt.Println("Summarization failed:", err)
+		return
+	}
+
+	if err := saveOutput(audioFilePath, summaryFolder, summary); err != nil {
+		fmt.Println("Failed to save summary:", err)
+	}
+}
+
+func transcribeAudio(filePath string) (string, error) {
+	fmt.Println("Starting transcription...")
+	cmd := exec.Command("python", "transcribe.py", filePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("transcription error: %v\nOutput: %s", err, output)
+	}
+	return string(output), nil
+}
+
+func saveOutput(audioPath, folder string, content string) error {
+	os.MkdirAll(folder, os.ModePerm)
+	base := filepath.Base(audioPath)
+	outputPath := filepath.Join(folder, strings.TrimSuffix(base, ".mp3")+".txt")
+	return os.WriteFile(outputPath, []byte(content), 0644)
+}
+
+func randomDelay(min, max int) {
+	time.Sleep(time.Duration(min + rand.Intn(max-min)) * time.Second)
+}
+
+func isElementVisible(loc playwright.Locator) bool {
+	visible, _ := loc.IsVisible()
+	return visible
+}
+

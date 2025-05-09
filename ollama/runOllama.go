@@ -9,6 +9,7 @@ import (
 )
 
 func RunOllama(transcribe string) (string, error) {
+	fmt.Println("Summarizing with Ollama...")
 	cmd := exec.Command("ollama", "run", "llama3.2", "Strictly summarize this in 100 words \n"+transcribe)
 	cmd.Env = os.Environ()
 
